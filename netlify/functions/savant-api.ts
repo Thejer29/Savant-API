@@ -4,32 +4,16 @@ import { parse } from "csv-parse/sync";
 
 // --- DATA SOURCES ---
 const ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard";
-// NOTE: Ensure this year matches the current season start year (e.g. 2024 for 24-25 season)
 const MONEYPUCK_TEAMS_URL = "https://moneypuck.com/moneypuck/playerData/seasonSummary/2024/regular/teams.csv";
 const MONEYPUCK_GOALIES_URL = "https://moneypuck.com/moneypuck/playerData/seasonSummary/2024/regular/goalies.csv";
 
 // --- CACHE ---
 let cachedTeamStats: any = null;
 let cachedGoalieStats: any = null;
-let cachedEspnData: any = null;
 let lastFetchTime = 0;
-let lastOddsFetchTime = 0;
 const STATS_CACHE_DURATION = 1000 * 60 * 60; // 1 Hour
-const ODDS_CACHE_DURATION = 1000 * 60 * 5;   // 5 Minutes
 
-// --- HELPER: SAFE NUMBER PARSER ---
-// Tries multiple column names and handles empty strings/NaN safely
-const getFloat = (row: any, keys: string[]) => {
-  for (const key of keys) {
-    if (row[key] !== undefined && row[key] !== null && row[key] !== "") {
-      const val = parseFloat(row[key]);
-      if (!isNaN(val)) return val;
-    }
-  }
-  return 0;
-};
-
-// --- TEAM MAPPING HELPER ---
+// --- TEAM MAPPING ---
 const normalizeTeamCode = (input: string) => {
   if (!input) return "UNK";
   const map: Record<string, string> = {
@@ -70,61 +54,70 @@ const normalizeTeamCode = (input: string) => {
 };
 
 export const handler: Handler = async (event) => {
-  const { home, away, homeGoalie, awayGoalie, action } = event.queryStringParameters || {};
-  const currentTime = Date.now();
+  const { home, away, homeGoalie, awayGoalie, action, date } = event.queryStringParameters || {};
 
-  // CONFIG: Spoof a real browser to avoid 403 Forbidden errors
+  // CONFIG: Spoof Browser
   const axiosConfig = {
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+      'Accept': 'application/json'
     }
   };
 
-  // --- 1. FETCH ODDS/SCHEDULE (Short Cache) ---
-  if (!cachedEspnData || (currentTime - lastOddsFetchTime > ODDS_CACHE_DURATION)) {
-    console.log("Fetching ESPN Data...");
+  // ==========================================
+  // MODE A: SCHEDULE (Fetch Games List)
+  // ==========================================
+  if (action === "schedule") {
     try {
-      const espnRes = await axios.get(ESPN_SCOREBOARD_URL, axiosConfig);
-      cachedEspnData = espnRes.data;
-      lastOddsFetchTime = currentTime;
-    } catch (e) {
-      console.error("ESPN Fetch Failed:", e);
+      // If a date is provided (YYYYMMDD), use it. Otherwise, ESPN defaults to today.
+      const url = date ? `${ESPN_SCOREBOARD_URL}?dates=${date}` : ESPN_SCOREBOARD_URL;
+      
+      console.log(`Fetching Schedule from: ${url}`);
+      const espnRes = await axios.get(url, axiosConfig);
+      const events = espnRes.data.events || [];
+
+      const games = events.map((evt: any) => {
+        const competition = evt.competitions[0];
+        const homeComp = competition.competitors.find((c: any) => c.homeAway === 'home');
+        const awayComp = competition.competitors.find((c: any) => c.homeAway === 'away');
+        
+        return {
+          id: evt.id,
+          date: evt.date,
+          status: evt.status.type.shortDetail, // "7:00 PM ET"
+          homeTeam: {
+            name: homeComp.team.displayName,
+            code: normalizeTeamCode(homeComp.team.abbreviation),
+            score: homeComp.score,
+            logo: homeComp.team.logo
+          },
+          awayTeam: {
+            name: awayComp.team.displayName,
+            code: normalizeTeamCode(awayComp.team.abbreviation),
+            score: awayComp.score,
+            logo: awayComp.team.logo
+          }
+        };
+      });
+
+      return {
+        statusCode: 200,
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+        body: JSON.stringify({ games, date: date || "Today", count: games.length }),
+      };
+
+    } catch (error) {
+      console.error("Schedule Fetch Error:", error);
+      return {
+        statusCode: 500,
+        body: JSON.stringify({ error: "Failed to fetch schedule", details: String(error) }),
+      };
     }
   }
 
-  // === MODE A: RETURN SCHEDULE ===
-  if (action === "schedule") {
-    const games = cachedEspnData?.events?.map((evt: any) => {
-      const competition = evt.competitions[0];
-      const homeComp = competition.competitors.find((c: any) => c.homeAway === 'home');
-      const awayComp = competition.competitors.find((c: any) => c.homeAway === 'away');
-      
-      return {
-        id: evt.id,
-        date: evt.date,
-        status: evt.status.type.shortDetail, 
-        homeTeam: {
-          name: homeComp.team.displayName,
-          code: normalizeTeamCode(homeComp.team.abbreviation),
-          score: homeComp.score
-        },
-        awayTeam: {
-          name: awayComp.team.displayName,
-          code: normalizeTeamCode(awayComp.team.abbreviation),
-          score: awayComp.score
-        }
-      };
-    }) || [];
-
-    return {
-      statusCode: 200,
-      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-      body: JSON.stringify({ games, source: "ESPN" }),
-    };
-  }
-
-  // === MODE B: RETURN DETAILED STATS ===
+  // ==========================================
+  // MODE B: STATS & ODDS (Single Game)
+  // ==========================================
   if (!home || !away) {
     return { statusCode: 400, body: "Missing 'home' or 'away' parameters." };
   }
@@ -133,7 +126,9 @@ export const handler: Handler = async (event) => {
   const targetAway = normalizeTeamCode(away);
 
   try {
-    // Fetch MoneyPuck Stats (Long Cache)
+    const currentTime = Date.now();
+
+    // 1. FETCH MONEYPUCK STATS
     if (!cachedTeamStats || (currentTime - lastFetchTime > STATS_CACHE_DURATION)) {
       console.log("Fetching MoneyPuck Stats...");
       const [mpTeamsRes, mpGoaliesRes] = await Promise.all([
@@ -145,10 +140,14 @@ export const handler: Handler = async (event) => {
       lastFetchTime = currentTime;
     }
 
-    // Find Live Odds from ESPN Cache
+    // 2. FETCH LIVE ODDS (ESPN)
+    // We fetch fresh every time for specific game odds to ensure accuracy
     let gameOdds = null;
-    if (cachedEspnData && cachedEspnData.events) {
-      const game = cachedEspnData.events.find((evt: any) => {
+    try {
+      const espnRes = await axios.get(ESPN_SCOREBOARD_URL, axiosConfig);
+      const events = espnRes.data.events || [];
+      
+      const game = events.find((evt: any) => {
         const competitors = evt.competitions[0].competitors;
         const teamA = normalizeTeamCode(competitors[0].team.abbreviation);
         const teamB = normalizeTeamCode(competitors[1].team.abbreviation);
@@ -157,65 +156,52 @@ export const handler: Handler = async (event) => {
       });
 
       if (game) {
-        const oddsObj = game.competitions[0].odds ? game.competitions[0].odds[0] : null;
-        if (oddsObj) {
+        const competition = game.competitions[0];
+        // ESPN Odds Structure varies, usually in competition.odds
+        const oddsSource = competition.odds ? competition.odds[0] : null;
+        
+        if (oddsSource) {
           gameOdds = {
-            source: "ESPN (Live)",
-            line: oddsObj.details || "N/A",
-            total: oddsObj.overUnder || 6.5,
-            description: "Market consensus" 
+            source: "ESPN",
+            line: oddsSource.details || "N/A", // Spread e.g. "TOR -1.5"
+            total: oddsSource.overUnder || 6.5,
+            moneyline: "See Book" // ESPN API often hides raw ML in summary
           };
         }
       }
+    } catch (e) {
+      console.log("Odds fetch failed, continuing with stats only.");
     }
 
-    // Extract Stats Logic
+    // 3. EXTRACT STATS (Helper)
+    const getFloat = (row: any, keys: string[]) => {
+      for (const key of keys) {
+        if (row[key] !== undefined && row[key] !== null && row[key] !== "") {
+          const val = parseFloat(row[key]);
+          if (!isNaN(val)) return val;
+        }
+      }
+      return 0;
+    };
+
     const getSavantStats = (teamCode: string, goalieName?: string) => {
-      // Filter Rows
       const teamRow = cachedTeamStats.find((row: any) => normalizeTeamCode(row.team) === teamCode && row.situation === "5on5");
       const teamAllRow = cachedTeamStats.find((row: any) => normalizeTeamCode(row.team) === teamCode && row.situation === "all");
 
-      if (!teamRow) {
-        console.log(`WARN: No stats found for team ${teamCode}`);
-        return null;
-      }
+      if (!teamRow) return null;
 
-      // --- SAFE NUMBER EXTRACTION ---
-      // We look for multiple possible column names to prevent breaking changes
+      const hdShotsFor = getFloat(teamRow, ['highDangerShotsFor', 'highDangerGoalsFor', 'flurryAdjustedxGoalsFor']);
+      const hdShotsAgainst = getFloat(teamRow, ['highDangerShotsAgainst', 'highDangerGoalsAgainst', 'flurryAdjustedxGoalsAgainst']);
+      const hdcfPercent = (hdShotsFor + hdShotsAgainst) > 0 ? (hdShotsFor / (hdShotsFor + hdShotsAgainst)) * 100 : 50;
+
+      const iceTimeSeconds = getFloat(teamRow, ['iceTime']) || 1;
+      const xGA = getFloat(teamRow, ['xGoalsAgainst', 'scoreVenueAdjustedxGoalsAgainst']);
+      const xgaPer60 = (xGA / iceTimeSeconds) * 3600;
       
-      // HDCF% Calculation
-      // Try 'highDangerShotsFor', then 'highDangerGoalsFor', then 'highDangerxGoals'
-      const hdShotsFor = getFloat(teamRow, ['highDangerShotsFor', 'highDangerGoalsFor', 'highDangerxGoals', 'flurryAdjustedxGoalsFor']); 
-      const hdShotsAgainst = getFloat(teamRow, ['highDangerShotsAgainst', 'highDangerGoalsAgainst', 'highDangerxGoalsAgainst', 'flurryAdjustedxGoalsAgainst']);
-      const hdcfPercent = (hdShotsFor + hdShotsAgainst) > 0 
-        ? (hdShotsFor / (hdShotsFor + hdShotsAgainst)) * 100 
-        : 50;
+      const allIceTime = getFloat(teamAllRow, ['iceTime']) || 1;
+      const gfPerGame = (getFloat(teamAllRow, ['goalsFor']) / allIceTime) * 3600;
+      const gaPerGame = (getFloat(teamAllRow, ['goalsAgainst']) / allIceTime) * 3600;
 
-      // Rate Stats (Per 60)
-      const iceTimeSeconds = getFloat(teamRow, ['iceTime']);
-      const iceTimeAll = getFloat(teamAllRow, ['iceTime']);
-      
-      const xGA_total = getFloat(teamRow, ['xGoalsAgainst', 'scoreVenueAdjustedxGoalsAgainst']);
-      const xgaPer60 = iceTimeSeconds > 0 ? (xGA_total / iceTimeSeconds) * 3600 : 2.5;
-
-      const gf_total = getFloat(teamAllRow, ['goalsFor']);
-      const ga_total = getFloat(teamAllRow, ['goalsAgainst']);
-      const gfPerGame = iceTimeAll > 0 ? (gf_total / iceTimeAll) * 3600 : 3.0;
-      const gaPerGame = iceTimeAll > 0 ? (ga_total / iceTimeAll) * 3600 : 3.0;
-
-      // Special Teams
-      const ppGoals = getFloat(teamAllRow, ['ppGoalsFor']);
-      const ppOpps = getFloat(teamAllRow, ['penaltiesDrawn']); // Approx opportunities
-      const ppPercent = ppOpps > 0 ? (ppGoals / ppOpps) * 100 : 0;
-
-      const pkGoalsAllowed = getFloat(teamAllRow, ['ppGoalsAgainst']);
-      const pkOpps = getFloat(teamAllRow, ['penaltiesTaken']); // Approx opportunities
-      const pkPercent = pkOpps > 0 ? 100 - ((pkGoalsAllowed / pkOpps) * 100) : 0;
-      
-      const pims = getFloat(teamAllRow, ['penaltiesMinutes']);
-      const pimsPerGame = iceTimeAll > 0 ? (pims / (iceTimeAll / 3600)) : 8.0;
-
-      // Goalie Stats
       let gsax = 0.0;
       let svPercent = 0.0;
       let gaa = 0.0;
@@ -226,32 +212,27 @@ export const handler: Handler = async (event) => {
           g.name.toLowerCase().includes(goalieName.toLowerCase())
         );
         if (goalieRow) {
-          const totalGSAx = getFloat(goalieRow, ['goalsSavedAboveExpected']);
-          const gTime = getFloat(goalieRow, ['iceTime']);
-          const gGoals = getFloat(goalieRow, ['goalsAgainst']);
-          
-          gsax = gTime > 0 ? (totalGSAx / gTime) * 3600 : 0;
+          const gTime = getFloat(goalieRow, ['iceTime']) || 1;
+          gsax = (getFloat(goalieRow, ['goalsSavedAboveExpected']) / gTime) * 3600;
           svPercent = getFloat(goalieRow, ['savePercentage']);
-          gaa = gTime > 0 ? (gGoals * 3600) / gTime : 0;
+          gaa = (getFloat(goalieRow, ['goalsAgainst']) * 3600) / gTime;
         }
       }
 
       return {
         name: teamCode,
-        gfPerGame: gfPerGame,
-        gaPerGame: gaPerGame,
-        xgaPer60: xgaPer60,
-        ppPercent: ppPercent,
-        pkPercent: pkPercent,
-        pimsPerGame: pimsPerGame,
+        gfPerGame, gaPerGame, xgaPer60,
+        ppPercent: (getFloat(teamAllRow, ['ppGoalsFor']) / getFloat(teamAllRow, ['penaltiesDrawn'])) * 100 || 0,
+        pkPercent: 100 - ((getFloat(teamAllRow, ['ppGoalsAgainst']) / getFloat(teamAllRow, ['penaltiesTaken'])) * 100 || 0),
+        pimsPerGame: (getFloat(teamAllRow, ['penaltiesMinutes']) / (allIceTime / 3600)) || 8.0,
         xgfPercent: getFloat(teamRow, ['xGoalsPercentage']) * 100,
-        hdcfPercent: hdcfPercent,
+        hdcfPercent,
         shootingPercent: getFloat(teamRow, ['shootingPercentage']) * 100,
         faceoffPercent: getFloat(teamAllRow, ['faceOffWinPercentage']) * 100,
         gsaxPer60: gsax,
-        svPercent: svPercent,
+        svPercent,
         corsiPercent: getFloat(teamRow, ['corsiPercentage']) * 100,
-        gaa: gaa
+        gaa
       };
     };
 
