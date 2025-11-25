@@ -1,10 +1,9 @@
 {
   "name": "savant-api-engine",
   "version": "2.0.0",
-  "description": "Savant Math Engine (Powered by MoneyPuck & ESPN)",
+  "description": "Savant Math Engine",
   "main": "netlify/functions/savant-api.ts",
   "scripts": {
-    "build": "tsc",
     "start": "netlify dev"
   },
   "dependencies": {
