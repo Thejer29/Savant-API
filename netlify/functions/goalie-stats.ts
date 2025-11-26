@@ -2,14 +2,19 @@ import { Handler } from "@netlify/functions";
 import axios from "axios";
 import { parse } from "csv-parse/sync";
 
-// --- SOURCE ---
-// We use MoneyPuck for the advanced metrics (GSAx) that ESPN doesn't provide.
+// --- DATA SOURCES ---
+// 1. MoneyPuck: For the advanced stats (GSAx)
 const MONEYPUCK_GOALIES_URL = "https://moneypuck.com/moneypuck/playerData/seasonSummary/2024/regular/goalies.csv";
+// 2. NHL Official API: For "Confirmed/Probable" starting status
+const NHL_SCHEDULE_URL = "https://api-web.nhle.com/v1/schedule/now";
 
 // --- CACHE ---
 let cachedGoalieStats: any = null;
+let cachedStarterData: any = null;
 let lastFetchTime = 0;
-const CACHE_DURATION = 1000 * 60 * 60; // 1 Hour Cache
+let lastStarterFetchTime = 0;
+const CACHE_DURATION = 1000 * 60 * 60; // 1 Hour (Stats)
+const STARTER_CACHE_DURATION = 1000 * 60 * 10; // 10 Minutes (Starters change often)
 
 // --- TEAM MAPPING ---
 const normalizeTeamCode = (input: string) => {
@@ -52,7 +57,6 @@ const normalizeTeamCode = (input: string) => {
 };
 
 // --- HELPER: SAFE NUMBER PARSER ---
-// Checks multiple possible keys for a value (handles capitalization/renaming)
 const getFloat = (row: any, keys: string[]) => {
   for (const key of keys) {
     if (row[key] !== undefined && row[key] !== null && row[key] !== "") {
@@ -65,16 +69,14 @@ const getFloat = (row: any, keys: string[]) => {
 
 export const handler: Handler = async (event) => {
   const { team, name } = event.queryStringParameters || {};
+  const currentTime = Date.now();
   
   try {
-    const currentTime = Date.now();
-
-    // 1. FETCH DATA (With Updated Browser Spoofing)
+    // 1. FETCH MONEYPUCK STATS (Long Cache)
     if (!cachedGoalieStats || (currentTime - lastFetchTime > CACHE_DURATION)) {
       console.log("Fetching MoneyPuck Goalie Stats...");
       const response = await axios.get(MONEYPUCK_GOALIES_URL, {
         headers: {
-          // Updated User-Agent to appear as a modern browser
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
           'Accept': 'text/csv,application/json,text/html'
         }
@@ -83,12 +85,43 @@ export const handler: Handler = async (event) => {
       lastFetchTime = currentTime;
     }
 
-    // 2. PROCESS & CALCULATE STATS
+    // 2. FETCH STARTING GOALIES (Short Cache)
+    // We use the NHL Official Schedule API to find today's confirmed starters
+    if (!cachedStarterData || (currentTime - lastStarterFetchTime > STARTER_CACHE_DURATION)) {
+       console.log("Fetching NHL Schedule for Starters...");
+       try {
+         const nhlRes = await axios.get(NHL_SCHEDULE_URL);
+         // The API returns a 'gameWeek' array. We want the first day (Today).
+         const todayGames = nhlRes.data.gameWeek?.[0]?.games || [];
+         
+         // Build a map: TeamCode -> { name: "Name", status: "confirmed" }
+         cachedStarterData = {};
+         todayGames.forEach((game: any) => {
+             if (game.awayTeam && game.awayTeam.startingGoalie) {
+                 const code = normalizeTeamCode(game.awayTeam.abbrev);
+                 cachedStarterData[code] = {
+                     name: `${game.awayTeam.startingGoalie.firstName.default} ${game.awayTeam.startingGoalie.lastName.default}`,
+                     status: "confirmed" // NHL API usually only populates this if confirmed/probable
+                 };
+             }
+             if (game.homeTeam && game.homeTeam.startingGoalie) {
+                 const code = normalizeTeamCode(game.homeTeam.abbrev);
+                 cachedStarterData[code] = {
+                     name: `${game.homeTeam.startingGoalie.firstName.default} ${game.homeTeam.startingGoalie.lastName.default}`,
+                     status: "confirmed"
+                 };
+             }
+         });
+         lastStarterFetchTime = currentTime;
+       } catch (e) {
+           console.error("Failed to fetch NHL starters:", e);
+           cachedStarterData = {}; // Fallback to empty
+       }
+    }
+
+    // 3. PROCESS & CALCULATE STATS
     let results = cachedGoalieStats.map((row: any) => {
-      // Check multiple possible column names for Ice Time
       const seconds = getFloat(row, ['iceTime', 'Icetime', 'timeOnIce', 'icetime']);
-      
-      // Filter out goalies who haven't played
       if (seconds <= 0) return null;
 
       const ga = getFloat(row, ['goalsAgainst', 'GoalsAgainst']);
@@ -96,28 +129,38 @@ export const handler: Handler = async (event) => {
       const svPct = getFloat(row, ['savePercentage', 'SavePercentage']);
       const gamesPlayed = getFloat(row, ['gamesPlayed', 'GamesPlayed']);
 
-      // --- MATH CALCULATIONS ---
-      
-      // 1. GAA Formula: (Goals Against * 3600) / Seconds Played
       const gaa = (ga * 3600) / seconds;
-
-      // 2. GSAx/60 Formula: (Total GSAx * 3600) / Seconds Played
       const gsaxPer60 = (totalGSAx * 3600) / seconds;
 
+      const teamCode = normalizeTeamCode(row.team || row.Team);
+      const goalieName = row.name || row.Name;
+      
+      // CHECK IF STARTER
+      // We check if this goalie's team has a starter listed, and if the names match loosely
+      let starterInfo = { isStarter: false, status: "Unconfirmed" };
+      if (cachedStarterData && cachedStarterData[teamCode]) {
+          const starter = cachedStarterData[teamCode];
+          // Simple includes check covers "Bobrovsky" matching "Sergei Bobrovsky"
+          if (starter.name.includes(goalieName) || goalieName.includes(starter.name.split(" ").pop()!)) {
+              starterInfo = { isStarter: true, status: starter.status };
+          }
+      }
+
       return {
-        name: row.name || row.Name,
-        team: normalizeTeamCode(row.team || row.Team),
+        name: goalieName,
+        team: teamCode,
         gamesPlayed: gamesPlayed,
         stats: {
           gaa: parseFloat(gaa.toFixed(2)),
           svPercent: svPct,
           gsaxPer60: parseFloat(gsaxPer60.toFixed(3)),
           totalGSAx: parseFloat(totalGSAx.toFixed(2))
-        }
+        },
+        starter: starterInfo // New Field
       };
-    }).filter((g: any) => g !== null); // Remove nulls
+    }).filter((g: any) => g !== null);
 
-    // 3. OPTIONAL FILTERING
+    // 4. OPTIONAL FILTERING
     if (team) {
       const targetTeam = normalizeTeamCode(team);
       results = results.filter((g: any) => g.team === targetTeam);
@@ -128,8 +171,13 @@ export const handler: Handler = async (event) => {
       results = results.filter((g: any) => g.name.toLowerCase().includes(targetName));
     }
 
-    // 4. SORTING (Best GSAx first)
-    results.sort((a: any, b: any) => b.stats.gsaxPer60 - a.stats.gsaxPer60);
+    // 5. SORTING
+    // Prioritize Confirmed Starters, then by GSAx
+    results.sort((a: any, b: any) => {
+        if (a.starter.isStarter && !b.starter.isStarter) return -1;
+        if (!a.starter.isStarter && b.starter.isStarter) return 1;
+        return b.stats.gsaxPer60 - a.stats.gsaxPer60;
+    });
 
     return {
       statusCode: 200,
