@@ -85,10 +85,17 @@ export const handler: Handler = async (event) => {
     }
   };
 
-  // --- 1. SCHEDULE MODE ---
+ // ==========================================
+  // MODE A: SCHEDULE (Fetch Games List)
+  // ==========================================
   if (action === "schedule") {
     try {
-      const url = date ? `${ESPN_SCOREBOARD_URL}?dates=${date}` : ESPN_SCOREBOARD_URL;
+      // FIX: Strip dashes from date (2025-11-28 -> 20251128)
+      // ESPN requires compact YYYYMMDD format.
+      const cleanDate = date ? date.replace(/-/g, "") : "";
+      
+      const url = cleanDate ? `${ESPN_SCOREBOARD_URL}?dates=${cleanDate}` : ESPN_SCOREBOARD_URL;
+      
       const espnRes = await axios.get(url, axiosConfig);
       const events = espnRes.data.events || [];
 
@@ -101,18 +108,28 @@ export const handler: Handler = async (event) => {
           id: evt.id,
           date: evt.date,
           status: evt.status.type.shortDetail, 
-          homeTeam: { name: homeComp.team.displayName, code: normalizeTeamCode(homeComp.team.abbreviation), score: homeComp.score },
-          awayTeam: { name: awayComp.team.displayName, code: normalizeTeamCode(awayComp.team.abbreviation), score: awayComp.score }
+          homeTeam: {
+            name: homeComp.team.displayName,
+            code: normalizeTeamCode(homeComp.team.abbreviation),
+            score: homeComp.score,
+            logo: homeComp.team.logo
+          },
+          awayTeam: {
+            name: awayComp.team.displayName,
+            code: normalizeTeamCode(awayComp.team.abbreviation),
+            score: awayComp.score,
+            logo: awayComp.team.logo
+          }
         };
       });
 
       return {
         statusCode: 200,
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-        body: JSON.stringify({ games, count: games.length }),
+        body: JSON.stringify({ games, count: games.length, dateUsed: cleanDate || "Default" }),
       };
     } catch (error) {
-      return { statusCode: 500, body: JSON.stringify({ error: "Schedule Fetch Failed" }) };
+      return { statusCode: 500, body: JSON.stringify({ error: "Schedule Fetch Failed", details: String(error) }) };
     }
   }
 
