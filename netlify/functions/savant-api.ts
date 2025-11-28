@@ -77,11 +77,11 @@ export const handler: Handler = async (event) => {
   const { home, away, homeGoalie, awayGoalie, action, date } = event.queryStringParameters || {};
   const currentTime = Date.now();
 
-  // CONFIG: Spoof Browser
+  // CONFIG: Spoof Browser to avoid 403 Forbidden
   const axiosConfig = {
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Accept': 'application/json'
+      'Accept': 'application/json,text/csv'
     }
   };
 
@@ -91,6 +91,7 @@ export const handler: Handler = async (event) => {
   if (action === "schedule") {
     try {
       const url = date ? `${ESPN_SCOREBOARD_URL}?dates=${date}` : ESPN_SCOREBOARD_URL;
+      
       const espnRes = await axios.get(url, axiosConfig);
       const events = espnRes.data.events || [];
 
@@ -106,12 +107,14 @@ export const handler: Handler = async (event) => {
           homeTeam: {
             name: homeComp.team.displayName,
             code: normalizeTeamCode(homeComp.team.abbreviation),
-            score: homeComp.score
+            score: homeComp.score,
+            logo: homeComp.team.logo
           },
           awayTeam: {
             name: awayComp.team.displayName,
             code: normalizeTeamCode(awayComp.team.abbreviation),
-            score: awayComp.score
+            score: awayComp.score,
+            logo: awayComp.team.logo
           }
         };
       });
@@ -122,12 +125,12 @@ export const handler: Handler = async (event) => {
         body: JSON.stringify({ games, count: games.length }),
       };
     } catch (error) {
-      return { statusCode: 500, body: JSON.stringify({ error: "Schedule Fetch Failed" }) };
+      return { statusCode: 500, body: JSON.stringify({ error: "Schedule Fetch Failed", details: String(error) }) };
     }
   }
 
   // ==========================================
-  // MODE B: FULL GAME INTEL (Stats + Odds + Goalies)
+  // MODE B: FULL GAME INTEL
   // ==========================================
   if (!home || !away) {
     return { statusCode: 400, body: "Missing 'home' or 'away' parameters." };
@@ -187,49 +190,68 @@ export const handler: Handler = async (event) => {
         const teamB = normalizeTeamCode(competitors[1].team.abbreviation);
         return (teamA === targetHome && teamB === targetAway) || (teamA === targetAway && teamB === targetHome);
       });
-      if (game && game.competitions[0].odds) {
-        gameOdds = {
-          source: "ESPN",
-          line: game.competitions[0].odds[0].details || "N/A",
-          total: game.competitions[0].odds[0].overUnder || 6.5
-        };
+      if (game) {
+        const comp = game.competitions?.[0];
+        const oddsObj = comp?.odds?.[0] || null;
+        if (oddsObj) {
+          gameOdds = {
+            source: "ESPN",
+            line: oddsObj.details || "N/A",
+            total: oddsObj.overUnder || 6.5
+          };
+        }
       }
     }
 
-    // 4. EXTRACT STATS LOGIC
+    // 4. EXTRACT STATS LOGIC (With Smart Goalie Fallback)
     const getSavantStats = (teamCode: string, requestedGoalie?: string) => {
       const teamRow = cachedTeamStats.find((row: any) => normalizeTeamCode(row.team) === teamCode && row.situation === "5on5");
       const teamAllRow = cachedTeamStats.find((row: any) => normalizeTeamCode(row.team) === teamCode && row.situation === "all");
 
       if (!teamRow) return null;
 
-      // Resolve Goalie: User Request -> Confirmed Starter -> Top Goalie (Fallback)
+      // --- SMARTER GOALIE SELECTION START ---
       let targetGoalieName = requestedGoalie;
       let starterStatus = "Unconfirmed";
 
+      // 1. Check Confirmed Starter from NHL API
       if (!targetGoalieName && cachedStarterData && cachedStarterData[teamCode]) {
           targetGoalieName = cachedStarterData[teamCode].name;
-          starterStatus = "Confirmed (NHL)";
+          starterStatus = cachedStarterData[teamCode].status || "Probable";
       }
+
+      // 2. Filter Goalies for this Team
+      const teamGoalies = cachedGoalieStats.filter((g: any) => 
+        normalizeTeamCode(g.team) === teamCode
+      );
+
+      let goalieRow = null;
+
+      if (targetGoalieName) {
+          // Fuzzy match name
+          goalieRow = teamGoalies.find((g: any) => 
+            g.name.toLowerCase().includes(targetGoalieName!.toLowerCase().split(" ").pop()!)
+          );
+      }
+
+      // 3. FALLBACK: If no specific goalie found, grab the #1 by Games Played
+      if (!goalieRow && teamGoalies.length > 0) {
+          teamGoalies.sort((a: any, b: any) => getFloat(b, ['gamesPlayed']) - getFloat(a, ['gamesPlayed']));
+          goalieRow = teamGoalies[0];
+          starterStatus = "Projected #1"; // Label as projection so we know it's a guess
+      }
+      // --- SMARTER GOALIE SELECTION END ---
 
       let goalieStats = { gsax: 0, gaa: 0, svPct: 0, name: "Average Goalie" };
       
-      if (targetGoalieName) {
-          // Fuzzy match name
-          const gRow = cachedGoalieStats.find((g: any) => 
-            normalizeTeamCode(g.team) === teamCode && 
-            g.name.toLowerCase().includes(targetGoalieName!.toLowerCase().split(" ").pop()!)
-          );
-          
-          if (gRow) {
-              const gTime = getFloat(gRow, ['iceTime']) || 1;
-              goalieStats = {
-                  name: gRow.name,
-                  gsax: (getFloat(gRow, ['goalsSavedAboveExpected']) / gTime) * 3600,
-                  gaa: (getFloat(gRow, ['goalsAgainst']) * 3600) / gTime,
-                  svPct: getFloat(gRow, ['savePercentage'])
-              };
-          }
+      if (goalieRow) {
+          const gTime = getFloat(goalieRow, ['iceTime']) || 1;
+          goalieStats = {
+              name: goalieRow.name,
+              gsax: (getFloat(goalieRow, ['goalsSavedAboveExpected']) / gTime) * 3600,
+              gaa: (getFloat(goalieRow, ['goalsAgainst']) * 3600) / gTime,
+              svPct: getFloat(goalieRow, ['savePercentage'])
+          };
       }
 
       // Team Stats
@@ -252,7 +274,6 @@ export const handler: Handler = async (event) => {
         faceoffPercent: getFloat(teamAllRow, ['faceOffWinPercentage']) * 100,
         corsiPercent: getFloat(teamRow, ['corsiPercentage']) * 100,
         
-        // Goalie Data (Pre-packaged)
         goalie: {
            ...goalieStats,
            status: starterStatus
